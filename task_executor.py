@@ -27,6 +27,17 @@ try:
 except ImportError:
     BENCH_ENABLED = False
 
+# Context Engineer
+FLEET_BUS_DIR = os.path.join(os.path.dirname(__file__), "..", "fleet-bus")
+sys.path.insert(0, os.path.abspath(FLEET_BUS_DIR))
+try:
+    import context_engineer as CE
+    CE_ENABLED = True
+except ImportError:
+    CE_ENABLED = False
+    log_placeholder = logging.getLogger("executor")
+    log_placeholder.warning("context_engineer not found — CE disabled")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [executor] %(message)s",
@@ -115,11 +126,32 @@ def build_agent_prompt(task: dict) -> str:
 
     instructions = type_instructions.get(task_type, type_instructions["generic"])
 
+    # Context Engineer bundle (pre-loaded before spawn)
+    ctx = task.get("_context", {})
+    context_section = ""
+    if ctx and ctx.get("summary"):
+        lines = [f"## Fleet Context (pre-loaded by Context Engineer)"]
+        lines.append(f"**Summary:** {ctx['summary']}")
+        if ctx.get("relevant_files"):
+            lines.append(f"**Relevant files:** {', '.join(ctx['relevant_files'][:5])}")
+        if ctx.get("prior_decisions"):
+            lines.append("**Prior decisions:**")
+            for d in ctx["prior_decisions"][:4]:
+                lines.append(f"  - {d}")
+        if ctx.get("warnings"):
+            lines.append("**Warnings:**")
+            for w in ctx["warnings"][:3]:
+                lines.append(f"  ⚠️ {w}")
+        if ctx.get("key_facts"):
+            facts = "; ".join(f"{k}={v}" for k, v in list(ctx["key_facts"].items())[:4])
+            lines.append(f"**Key facts:** {facts}")
+        context_section = "\n".join(lines) + "\n\n"
+
     return f"""## Fleet Task #{task_id}
 
 {instructions}
 
-## Task
+{context_section}## Task
 {payload}
 
 ## Output Requirements
@@ -303,6 +335,31 @@ def executor_loop(dry_run: bool = False, once: bool = False):
                         )
                     except Exception as be:
                         log.debug(f"Benchmark start error: {be}")
+
+                # Context Engineer — pre-load context before spawning
+                context_bundle = None
+                if CE_ENABLED:
+                    try:
+                        context_bundle = CE.run(
+                            task_id=claimed["id"],
+                            task_type=claimed.get("type", "generic"),
+                            payload=claimed.get("payload", ""),
+                        )
+                        # Store context path in task hash for the agent
+                        r.hset(f"task:{claimed['id']}", mapping={
+                            "context_path": context_bundle.get("_local_path", ""),
+                            "context_summary": context_bundle.get("summary", "")[:200],
+                            "context_ms": str(context_bundle.get("generation_ms", 0)),
+                        })
+                        log.info(f"CE: {context_bundle.get('memories_searched',0)} memories, "
+                                 f"{context_bundle.get('generation_ms',0)}ms — "
+                                 f"{context_bundle.get('summary','')[:60]}")
+                    except Exception as ce_err:
+                        log.warning(f"CE failed (non-blocking): {ce_err}")
+
+                # Inject context into claimed task for spawn
+                if context_bundle:
+                    claimed["_context"] = context_bundle
 
                 # Spawn sub-agent
                 spawn_result = spawn_sub_agent(claimed, dry_run=dry_run)
