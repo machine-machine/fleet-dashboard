@@ -135,6 +135,28 @@ def build_agent_prompt(task: dict) -> str:
 """
 
 
+def get_session_tokens(session_key: str) -> dict:
+    """
+    Fetch real token counts from the OpenClaw gateway session API.
+    Returns {"tokens_in": int, "tokens_out": int} or zeros on failure.
+    """
+    try:
+        import urllib.request
+        url = f"{OPENCLAW_GATEWAY}/api/sessions/{session_key}/status"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        usage = data.get("usage", data.get("tokens", {}))
+        return {
+            "tokens_in":  int(usage.get("input_tokens",  usage.get("tokens_in",  0)) or 0),
+            "tokens_out": int(usage.get("output_tokens", usage.get("tokens_out", 0)) or 0),
+            "session_key": session_key,
+        }
+    except Exception as e:
+        log.debug(f"Could not fetch session tokens for {session_key}: {e}")
+        return {"tokens_in": 0, "tokens_out": 0}
+
+
 def spawn_sub_agent(task: dict, dry_run: bool = False) -> dict:
     """
     Spawn a sub-agent via OpenClaw sessions_spawn.
@@ -163,17 +185,24 @@ def spawn_sub_agent(task: dict, dry_run: bool = False) -> dict:
             cmd, capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
-            # Try to parse session key from output
             output = result.stdout.strip()
-            log.info(f"Sub-agent spawned: {output[:100]}")
-            return {"success": True, "output": output}
+            # Try to extract session_key from output
+            session_key = None
+            for line in output.split("\n"):
+                if "session_key:" in line.lower() or "sessionkey:" in line.lower():
+                    session_key = line.split(":")[-1].strip()
+                    break
+                if line.strip() and len(line.strip()) == 36 and "-" in line:
+                    session_key = line.strip()  # UUID-like session key
+                    break
+            log.info(f"Sub-agent spawned (session={session_key}): {output[:80]}")
+            return {"success": True, "output": output, "session_key": session_key}
         else:
             log.warning(f"openclaw spawn failed: {result.stderr[:200]}")
             return {"error": result.stderr[:200]}
     except subprocess.TimeoutExpired:
         return {"error": "spawn command timed out"}
     except FileNotFoundError:
-        # openclaw not in PATH — try direct execution
         log.warning("openclaw not found, running task inline")
         return run_task_inline(task)
 
@@ -282,8 +311,12 @@ def executor_loop(dry_run: bool = False, once: bool = False):
                 if spawn_result.get("dry_run"):
                     pass  # dry run, just log
                 elif spawn_result.get("success"):
-                    # Mark as running
-                    r.hset(f"task:{claimed['id']}", mapping={"state": "running"})
+                    # Mark as running, store session key for later token lookup
+                    session_key = spawn_result.get("session_key") or ""
+                    r.hset(f"task:{claimed['id']}", mapping={
+                        "state": "running",
+                        "session_key": session_key,
+                    })
                     emit_event(r, AGENT_ID, "task_running",
                                task_id=claimed['id'],
                                spawn_result=str(spawn_result)[:80])
@@ -292,14 +325,18 @@ def executor_loop(dry_run: bool = False, once: bool = False):
                     if spawn_result.get("inline"):
                         complete_task(r, claimed["id"], True,
                                       f"processed inline by {AGENT_ID}")
+                        # Try to get real tokens from session if available
+                        real_tokens = {"tokens_in": 0, "tokens_out": 0}
+                        if session_key:
+                            real_tokens = get_session_tokens(session_key)
                         if BENCH_ENABLED:
                             try:
                                 BM.record_complete(
                                     r, claimed["id"],
                                     status="done",
-                                    tokens_in=0,
-                                    tokens_out=0,
-                                    notes=f"inline execution by {AGENT_ID}, {duration}s",
+                                    tokens_in=real_tokens["tokens_in"],
+                                    tokens_out=real_tokens["tokens_out"],
+                                    notes=f"inline by {AGENT_ID}, {duration}s wall-clock",
                                 )
                             except Exception as be:
                                 log.debug(f"Benchmark complete error: {be}")

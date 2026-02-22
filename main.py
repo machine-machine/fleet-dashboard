@@ -1209,15 +1209,15 @@ function fmtDuration(s) {
   if (s < 3600) return Math.round(s/60) + "m";
   return (s/3600).toFixed(1) + "h";
 }
-function fmtTokens(n) {
+function fmtTokens(n, src) {
   n = parseInt(n||0);
-  if (!n) return "—";
-  if (n >= 1000) return (n/1000).toFixed(1) + "k";
-  return n;
+  if (!n) return '<span style="color:#404060">pending</span>';
+  const val = n >= 1000 ? (n/1000).toFixed(1) + "k" : n;
+  return val;
 }
-function fmtCost(c) {
+function fmtCost(c, src) {
   c = parseFloat(c||0);
-  if (!c) return "—";
+  if (!c) return '<span style="color:#404060">—</span>';
   return "$" + c.toFixed(4);
 }
 function fmtDate(ts) {
@@ -1249,8 +1249,8 @@ function renderStats(s) {
   document.getElementById("s-done").textContent = s.done || 0;
   document.getElementById("s-running").textContent = s.running || 0;
   const tk = s.total_tokens || 0;
-  document.getElementById("s-tokens").textContent = tk >= 1000 ? (tk/1000).toFixed(0) + "k" : tk;
-  document.getElementById("s-tokens-sub").textContent = `↑${fmtTokens(s.total_tokens_in)} ↓${fmtTokens(s.total_tokens_out)}`;
+  document.getElementById("s-tokens").textContent = tk > 0 ? (tk >= 1000 ? (tk/1000).toFixed(0) + "k" : tk) : "—";
+  document.getElementById("s-tokens-sub").textContent = tk > 0 ? `↑${(s.total_tokens_in/1000).toFixed(0)}k ↓${(s.total_tokens_out/1000).toFixed(0)}k` : "session API pending";
   document.getElementById("s-cost").textContent = "$" + (s.total_cost_usd||0).toFixed(4);
   document.getElementById("s-dur").textContent = fmtDuration(s.avg_duration_s);
 }
