@@ -94,7 +94,7 @@ def get_fleet_data():
         tasks = []
         for key in r.scan_iter("task:*", count=50):
             tdata = r.hgetall(key) or {}
-            if tdata and tdata.get("state") in ("pending", "claimed", "running"):
+            if tdata and tdata.get("state") in ("pending", "claimed", "running", "paused"):
                 tid = tdata.get("id", key.replace("task:", ""))
                 tasks.append({
                     "id": tid,
@@ -187,6 +187,130 @@ async def list_tasks():
         return {"tasks": tasks}
     except Exception as e:
         return {"tasks": [], "error": str(e)}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """Cancel a pending/running/paused task. Kills sub-agent session if active."""
+    try:
+        r = get_redis()
+        key = f"task:{task_id}"
+        data = r.hgetall(key) or {}
+        if not data:
+            return {"error": "task not found"}
+
+        prev_state = data.get("state", "?")
+        if prev_state in ("done", "cancelled", "failed"):
+            return {"error": f"task already {prev_state}"}
+
+        # Kill sub-agent session via OpenClaw gateway if session_key present
+        session_key = data.get("session_key", "")
+        kill_result = None
+        if session_key:
+            try:
+                import urllib.request as _ur
+                req = _ur.Request(
+                    f"http://localhost:18789/api/sessions/{session_key}/kill",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                resp = _ur.urlopen(req, timeout=5)
+                kill_result = "session killed"
+            except Exception as ke:
+                kill_result = f"session kill failed: {ke}"
+
+        r.hset(key, mapping={
+            "state": "cancelled",
+            "cancelled_at": str(int(time.time())),
+            "cancelled_by": "human",
+        })
+        # Remove from any task-type queue
+        task_type = data.get("type", "generic")
+        r.lrem(f"queue:{task_type}", 0, task_id)
+
+        # Emit event
+        r.xadd("fleet:events", {
+            "agent": "m2",
+            "type": "task_cancelled",
+            "task_id": task_id,
+            "prev_state": prev_state,
+            "ts": str(int(time.time())),
+        }, maxlen=500)
+
+        return {"task_id": task_id, "status": "cancelled", "prev_state": prev_state,
+                "session": kill_result}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/tasks/{task_id}/pause")
+async def pause_task(task_id: str):
+    """Pause a pending or running task (executor will skip it until resumed)."""
+    try:
+        r = get_redis()
+        key = f"task:{task_id}"
+        data = r.hgetall(key) or {}
+        if not data:
+            return {"error": "task not found"}
+
+        prev_state = data.get("state", "?")
+        if prev_state in ("done", "cancelled", "failed", "paused"):
+            return {"error": f"cannot pause task in state {prev_state}"}
+
+        r.hset(key, mapping={
+            "state": "paused",
+            "paused_at": str(int(time.time())),
+            "_prev_state": prev_state,
+        })
+
+        r.xadd("fleet:events", {
+            "agent": "m2",
+            "type": "task_paused",
+            "task_id": task_id,
+            "prev_state": prev_state,
+            "ts": str(int(time.time())),
+        }, maxlen=500)
+
+        return {"task_id": task_id, "status": "paused", "prev_state": prev_state}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def resume_task(task_id: str):
+    """Resume a paused task — re-queues it as pending."""
+    try:
+        r = get_redis()
+        key = f"task:{task_id}"
+        data = r.hgetall(key) or {}
+        if not data:
+            return {"error": "task not found"}
+
+        if data.get("state") != "paused":
+            return {"error": f"task is not paused (state={data.get('state')})"}
+
+        task_type = data.get("type", "generic")
+        r.hset(key, mapping={
+            "state": "pending",
+            "assigned_to": "",
+            "claimed_at": "",
+            "session_key": "",
+            "context_path": "",
+            "context_summary": "",
+        })
+        r.rpush(f"queue:{task_type}", task_id)
+
+        r.xadd("fleet:events", {
+            "agent": "m2",
+            "type": "task_resumed",
+            "task_id": task_id,
+            "ts": str(int(time.time())),
+        }, maxlen=500)
+
+        return {"task_id": task_id, "status": "resumed"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/health")
@@ -387,6 +511,13 @@ HTML = """<!DOCTYPE html>
   .task-card .task-type { color:#a080ff; text-transform:uppercase; font-size:0.6rem; }
   .task-card .task-payload { color:#909090; }
   .task-card .task-agent { color:#00ff88; font-size:0.6rem; }
+  .task-controls { display:flex; gap:4px; margin-top:5px; }
+  .btn-task { border:none; border-radius:3px; padding:2px 7px; font-size:0.6rem;
+    font-family:inherit; cursor:pointer; letter-spacing:0.06em; transition:opacity 0.15s; }
+  .btn-task:hover { opacity:0.75; }
+  .btn-pause  { background:#332266; color:#a080ff; }
+  .btn-cancel { background:#330011; color:#ff3366; }
+  .btn-resume { background:#112233; color:#00aaff; }
   .state-pending { color:#ffaa00; }
   .state-claimed,.state-running { color:#00aaff; }
   .state-done { color:#00ff88; }
@@ -924,9 +1055,22 @@ function updateTasksPanel(tasks) {
     const ctxLine = t.context_summary
       ? `<div style="color:#604080;font-size:0.6rem;margin-top:2px;font-style:italic">${t.context_summary.slice(0,80)}</div>`
       : '';
-    return `<div class="task-card">
+    const isPaused    = t.state === "paused";
+    const isActive    = ["pending","claimed","running"].includes(t.state);
+    const controls = `<div class="task-controls">
+      ${isActive && t.state !== "pending"
+        ? `<button class="btn-task btn-pause"  onclick="taskAction('${t.id}','pause')">⏸ PAUSE</button>`
+        : ''}
+      ${isPaused
+        ? `<button class="btn-task btn-resume" onclick="taskAction('${t.id}','resume')">▶ RESUME</button>`
+        : ''}
+      ${isActive || isPaused
+        ? `<button class="btn-task btn-cancel" onclick="taskAction('${t.id}','cancel')">✕ CANCEL</button>`
+        : ''}
+    </div>`;
+    return `<div class="task-card" id="tcard-${t.id}">
       <div class="task-header">
-        <span class="task-id">#${t.id}</span>
+        <span class="task-id">#${t.id.slice(0,8)}</span>
         <span class="task-type">${t.type}</span>
         ${ceBadge}
       </div>
@@ -934,6 +1078,7 @@ function updateTasksPanel(tasks) {
       ${ctxLine}
       ${t.assigned_to ? `<div class="task-agent">→ ${t.assigned_to}</div>` : ''}
       <div class="state-${t.state}">${t.state}</div>
+      ${controls}
     </div>`;
   }).join("");
 }
@@ -943,6 +1088,42 @@ function updateFleetStatus(data) {
   const total = (data.agents||[]).length;
   document.getElementById("fleet-status").textContent =
     `${alive}/${total} agents alive · ${(data.tasks||[]).length} tasks · ${Date().slice(16,24)} UTC`;
+}
+
+async function taskAction(taskId, action) {
+  const card = document.getElementById("tcard-" + taskId);
+  if (!card) return;
+
+  // Optimistic UI: disable all buttons in card
+  card.querySelectorAll(".btn-task").forEach(b => { b.disabled = true; b.style.opacity = "0.4"; });
+
+  const confirmMsg = {
+    cancel: `Cancel task ${taskId.slice(0,8)}? This cannot be undone.`,
+    pause:  `Pause task ${taskId.slice(0,8)}?`,
+  }[action];
+  if (confirmMsg && !confirm(confirmMsg)) {
+    card.querySelectorAll(".btn-task").forEach(b => { b.disabled = false; b.style.opacity = ""; });
+    return;
+  }
+
+  try {
+    const resp = await fetch(`/api/tasks/${taskId}/${action}`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+    });
+    const data = await resp.json();
+    if (data.error) {
+      alert("Error: " + data.error);
+      card.querySelectorAll(".btn-task").forEach(b => { b.disabled = false; b.style.opacity = ""; });
+    } else {
+      // Flash the card state
+      card.style.opacity = "0.5";
+      setTimeout(() => { card.style.opacity = ""; }, 600);
+    }
+  } catch (e) {
+    alert("Request failed: " + e);
+    card.querySelectorAll(".btn-task").forEach(b => { b.disabled = false; b.style.opacity = ""; });
+  }
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────

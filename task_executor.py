@@ -288,13 +288,31 @@ def complete_task(r, task_id: str, success: bool, result: str = ""):
 
 
 def check_active_tasks(r) -> int:
-    """Count tasks currently assigned to this agent."""
+    """
+    Count tasks currently assigned to this agent.
+    Also detects externally-cancelled/paused tasks and records benchmarks for them.
+    """
     count = 0
-    pattern = f"task:*"
-    for key in r.scan_iter(pattern, count=100):
+    for key in r.scan_iter("task:*", count=100):
         data = r.hgetall(key)
-        if data.get("assigned_to") == AGENT_ID and data.get("state") in ("claimed", "running"):
+        if data.get("assigned_to") != AGENT_ID:
+            continue
+        state = data.get("state", "")
+        if state in ("claimed", "running"):
             count += 1
+        elif state == "cancelled" and data.get("cancelled_by") == "human":
+            # Task was externally cancelled while we held it
+            task_id = data.get("id", key.replace("task:", ""))
+            if not data.get("_executor_acked_cancel"):
+                log.info(f"Task {task_id} externally cancelled — cleaning up")
+                r.hset(key, "_executor_acked_cancel", "1")
+                if BENCH_ENABLED:
+                    try:
+                        BM.record_complete(r, task_id, status="cancelled",
+                                           tokens_in=0, tokens_out=0,
+                                           notes="cancelled by human via dashboard")
+                    except Exception:
+                        pass
     return count
 
 
