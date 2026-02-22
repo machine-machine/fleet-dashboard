@@ -19,6 +19,14 @@ import signal
 
 import redis
 
+# Benchmark registry
+sys.path.insert(0, os.path.dirname(__file__))
+try:
+    import benchmark as BM
+    BENCH_ENABLED = True
+except ImportError:
+    BENCH_ENABLED = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [executor] %(message)s",
@@ -252,8 +260,24 @@ def executor_loop(dry_run: bool = False, once: bool = False):
                     break
 
             if claimed:
+                task_start = time.time()
+
+                # Start benchmark record
+                if BENCH_ENABLED:
+                    try:
+                        BM.record_start(
+                            r,
+                            task_id=claimed["id"],
+                            task_type=claimed.get("type", "generic"),
+                            description=claimed.get("payload", "")[:200],
+                            agent=AGENT_ID,
+                        )
+                    except Exception as be:
+                        log.debug(f"Benchmark start error: {be}")
+
                 # Spawn sub-agent
                 spawn_result = spawn_sub_agent(claimed, dry_run=dry_run)
+                duration = int(time.time() - task_start)
 
                 if spawn_result.get("dry_run"):
                     pass  # dry run, just log
@@ -264,15 +288,35 @@ def executor_loop(dry_run: bool = False, once: bool = False):
                                task_id=claimed['id'],
                                spawn_result=str(spawn_result)[:80])
 
-                    # If inline (no sub-agent), complete immediately
+                    # If inline (no sub-agent), complete immediately + record benchmark
                     if spawn_result.get("inline"):
                         complete_task(r, claimed["id"], True,
                                       f"processed inline by {AGENT_ID}")
+                        if BENCH_ENABLED:
+                            try:
+                                BM.record_complete(
+                                    r, claimed["id"],
+                                    status="done",
+                                    tokens_in=0,
+                                    tokens_out=0,
+                                    notes=f"inline execution by {AGENT_ID}, {duration}s",
+                                )
+                            except Exception as be:
+                                log.debug(f"Benchmark complete error: {be}")
                 else:
                     # Spawn failed — requeue
                     error = spawn_result.get("error", "unknown")
                     log.warning(f"Failed to spawn for {claimed['id']}: {error}")
                     complete_task(r, claimed["id"], False, f"spawn failed: {error}")
+                    if BENCH_ENABLED:
+                        try:
+                            BM.record_complete(
+                                r, claimed["id"],
+                                status="failed",
+                                notes=f"spawn failed: {error}",
+                            )
+                        except Exception as be:
+                            log.debug(f"Benchmark fail record error: {be}")
             else:
                 log.debug("No pending tasks found")
 

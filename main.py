@@ -7,14 +7,23 @@ import asyncio
 import json
 import time
 import os
+import sys
 import uuid
 from datetime import datetime, timezone
-from typing import Set
+from typing import Set, Optional, List
 
 import redis
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
+
+# Benchmark registry
+sys.path.insert(0, os.path.dirname(__file__))
+try:
+    import benchmark as BM
+    BENCH_ENABLED = True
+except ImportError:
+    BENCH_ENABLED = False
 
 REDIS_HOST = os.getenv("FLEET_REDIS_HOST", "fleet-redis")
 REDIS_PORT = int(os.getenv("FLEET_REDIS_PORT", "6379"))
@@ -186,6 +195,80 @@ async def health():
         return {"status": "ok", "redis": "ok"}
     except Exception as e:
         return {"status": "degraded", "redis": str(e)}
+
+
+# ── Benchmark Registry ─────────────────────────────────────────────────────────
+
+@app.get("/api/benchmarks")
+async def list_benchmarks(status: Optional[str] = Query(None), limit: int = Query(50)):
+    if not BENCH_ENABLED:
+        return {"benchmarks": [], "error": "benchmark module not loaded"}
+    try:
+        r = get_redis()
+        benches = BM.list_benchmarks(r, limit=limit, status=status)
+        return {"benchmarks": benches, "count": len(benches)}
+    except Exception as e:
+        return {"benchmarks": [], "error": str(e)}
+
+
+@app.get("/api/benchmarks/stats")
+async def benchmark_stats():
+    if not BENCH_ENABLED:
+        return {"error": "benchmark module not loaded"}
+    try:
+        r = get_redis()
+        return BM.get_fleet_stats(r)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+class BenchmarkUpdate(BaseModel):
+    bench_id: str
+    status: str = "done"
+    tokens_in: int = 0
+    tokens_out: int = 0
+    model: str = "claude-sonnet-4-6"
+    artifacts: List[str] = []
+    notes: str = ""
+
+
+@app.post("/api/benchmarks/complete")
+async def complete_benchmark(update: BenchmarkUpdate):
+    if not BENCH_ENABLED:
+        return {"error": "benchmark module not loaded"}
+    try:
+        r = get_redis()
+        result = BM.record_complete(
+            r, update.bench_id,
+            status=update.status,
+            tokens_in=update.tokens_in,
+            tokens_out=update.tokens_out,
+            model=update.model,
+            artifacts=update.artifacts,
+            notes=update.notes,
+        )
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/benchmarks/start")
+async def start_benchmark(data: dict):
+    if not BENCH_ENABLED:
+        return {"error": "benchmark module not loaded"}
+    try:
+        r = get_redis()
+        bench_id = BM.record_start(
+            r,
+            task_id=data.get("task_id", str(uuid.uuid4())[:8]),
+            task_type=data.get("task_type", "generic"),
+            description=data.get("description", ""),
+            agent=data.get("agent", "m2"),
+            model=data.get("model", "claude-sonnet-4-6"),
+        )
+        return {"bench_id": bench_id}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── HTML ───────────────────────────────────────────────────────────────────────
@@ -360,7 +443,7 @@ HTML = """<!DOCTYPE html>
   <div id="graph-area">
     <div id="header">
       <h1>⚡ M2O Fleet Command</h1>
-      <div class="sub">machine.machine · autonomous agent fleet</div>
+      <div class="sub">machine.machine · autonomous agent fleet · <a href="/benchmarks" style="color:#6060a0;text-decoration:none;font-size:0.6rem;letter-spacing:0.1em;" target="_blank">benchmarks →</a></div>
     </div>
     <svg id="graph-svg"></svg>
     <canvas id="canvas-overlay"></canvas>
@@ -927,3 +1010,342 @@ setInterval(() => {
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML
+
+
+# ── Benchmarks page ────────────────────────────────────────────────────────────
+
+BENCH_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>M2O Fleet Benchmarks</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#050508; color:#e0e0ff; font-family:'Courier New',monospace; min-height:100vh; }
+  a { color:#a080ff; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+
+  #header {
+    padding:20px 32px; border-bottom:1px solid #1a1a3a;
+    display:flex; align-items:center; justify-content:space-between;
+  }
+  #header h1 { font-size:1rem; letter-spacing:0.3em; color:#a080ff;
+    text-shadow:0 0 20px #a080ff88; text-transform:uppercase; }
+  #header .nav { font-size:0.7rem; color:#606090; }
+  #header .nav a { color:#6060a0; margin-left:16px; }
+
+  #stats-row {
+    display:flex; gap:16px; padding:20px 32px; flex-wrap:wrap;
+    border-bottom:1px solid #0d0d1a;
+  }
+  .stat-card {
+    background:#0a0a18; border:1px solid #1a1a3a; border-radius:4px;
+    padding:14px 20px; min-width:130px;
+  }
+  .stat-label { font-size:0.6rem; color:#606090; text-transform:uppercase; letter-spacing:0.15em; margin-bottom:6px; }
+  .stat-value { font-size:1.4rem; color:#a080ff; font-weight:bold; }
+  .stat-sub { font-size:0.6rem; color:#404060; margin-top:3px; }
+
+  #filters {
+    padding:12px 32px; display:flex; gap:12px; align-items:center;
+    border-bottom:1px solid #0d0d1a;
+  }
+  .filter-btn {
+    background:#0d0d1a; border:1px solid #2a2a5a; color:#8080a0;
+    font-family:inherit; font-size:0.65rem; letter-spacing:0.1em;
+    text-transform:uppercase; padding:5px 12px; border-radius:3px; cursor:pointer;
+    transition:all 0.2s;
+  }
+  .filter-btn.active, .filter-btn:hover {
+    border-color:#a080ff; color:#a080ff; background:#1a0a3a;
+  }
+  #search-box {
+    background:#0d0d1a; border:1px solid #2a2a5a; color:#e0e0ff;
+    font-family:inherit; font-size:0.7rem; padding:5px 10px;
+    border-radius:3px; outline:none; min-width:220px;
+  }
+  #search-box:focus { border-color:#a080ff; }
+
+  #table-wrap { padding:20px 32px; overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; font-size:0.68rem; }
+  thead tr { border-bottom:1px solid #2a2a4a; }
+  th {
+    text-align:left; padding:8px 10px; color:#6060a0;
+    text-transform:uppercase; letter-spacing:0.12em; font-size:0.6rem;
+    white-space:nowrap; cursor:pointer; user-select:none;
+  }
+  th:hover { color:#a080ff; }
+  th .sort-arrow { margin-left:4px; opacity:0.4; }
+  th.sorted .sort-arrow { opacity:1; color:#a080ff; }
+
+  tbody tr { border-bottom:1px solid #0d0d1a; transition:background 0.15s; }
+  tbody tr:hover { background:#0a0a18; }
+  td { padding:10px 10px; vertical-align:top; }
+
+  .td-id { color:#6060a0; font-size:0.6rem; max-width:100px; word-break:break-all; }
+  .td-type { color:#a080ff; text-transform:uppercase; font-size:0.6rem; white-space:nowrap; }
+  .td-desc { color:#c0c0d8; max-width:280px; line-height:1.5; }
+  .td-agent { color:#44ff88; }
+  .td-dur { color:#e0c060; white-space:nowrap; }
+  .td-tokens { color:#60c0ff; white-space:nowrap; }
+  .td-cost { color:#ff9060; white-space:nowrap; }
+  .td-artifacts a { color:#6060a0; display:block; font-size:0.6rem; margin-bottom:2px; }
+  .td-artifacts a:hover { color:#a080ff; }
+  .status-done { color:#44ff88; }
+  .status-running { color:#00aaff; }
+  .status-failed { color:#ff4444; }
+
+  .td-notes { color:#606080; font-size:0.62rem; max-width:200px; line-height:1.4; }
+
+  #by-type { padding:0 32px 24px; display:flex; gap:16px; flex-wrap:wrap; }
+  .type-bar-wrap { background:#0a0a18; border:1px solid #1a1a3a; border-radius:4px; padding:12px 16px; min-width:160px; }
+  .type-bar-label { font-size:0.6rem; color:#606090; text-transform:uppercase; margin-bottom:6px; }
+  .type-bar-track { background:#0d0d20; border-radius:2px; height:6px; overflow:hidden; }
+  .type-bar-fill { height:100%; border-radius:2px; background:linear-gradient(90deg,#a080ff,#6040c0); transition:width 0.8s; }
+  .type-bar-count { font-size:0.7rem; color:#a080ff; margin-top:4px; }
+
+  #footer { padding:16px 32px; font-size:0.6rem; color:#404060; border-top:1px solid #0d0d1a; }
+  #footer span { margin-right:20px; }
+  .refresh-btn {
+    background:#0d0d1a; border:1px solid #2a2a5a; color:#8080a0;
+    font-family:inherit; font-size:0.65rem; padding:5px 12px;
+    border-radius:3px; cursor:pointer; float:right;
+  }
+  .refresh-btn:hover { border-color:#a080ff; color:#a080ff; }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>⚡ Fleet Benchmarks</h1>
+  <div class="nav">
+    <a href="/">← Fleet Command</a>
+    <a href="/api/benchmarks" target="_blank">JSON</a>
+    <a href="/api/benchmarks/stats" target="_blank">Stats</a>
+  </div>
+</div>
+
+<div id="stats-row">
+  <div class="stat-card">
+    <div class="stat-label">Total Tasks</div>
+    <div class="stat-value" id="s-total">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Completed</div>
+    <div class="stat-value" id="s-done" style="color:#44ff88">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Running</div>
+    <div class="stat-value" id="s-running" style="color:#00aaff">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Total Tokens</div>
+    <div class="stat-value" id="s-tokens" style="color:#60c0ff; font-size:1.1rem">—</div>
+    <div class="stat-sub" id="s-tokens-sub"></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Total Cost</div>
+    <div class="stat-value" id="s-cost" style="color:#ff9060">—</div>
+    <div class="stat-sub">USD (est.)</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Avg Duration</div>
+    <div class="stat-value" id="s-dur" style="font-size:1.1rem">—</div>
+  </div>
+</div>
+
+<div id="filters">
+  <button class="filter-btn active" data-filter="all">ALL</button>
+  <button class="filter-btn" data-filter="done">DONE</button>
+  <button class="filter-btn" data-filter="running">RUNNING</button>
+  <button class="filter-btn" data-filter="failed">FAILED</button>
+  <input id="search-box" type="text" placeholder="search descriptions, types, agents..." />
+  <button class="refresh-btn" onclick="loadData()">⟳ REFRESH</button>
+</div>
+
+<div id="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th data-col="task_id">ID <span class="sort-arrow">↕</span></th>
+        <th data-col="task_type">TYPE <span class="sort-arrow">↕</span></th>
+        <th data-col="description">DESCRIPTION</th>
+        <th data-col="agent">AGENT <span class="sort-arrow">↕</span></th>
+        <th data-col="status">STATUS <span class="sort-arrow">↕</span></th>
+        <th data-col="duration_s">DURATION <span class="sort-arrow">↕</span></th>
+        <th data-col="tokens_in">TOKENS IN <span class="sort-arrow">↕</span></th>
+        <th data-col="tokens_out">TOKENS OUT <span class="sort-arrow">↕</span></th>
+        <th data-col="cost_usd">COST <span class="sort-arrow">↕</span></th>
+        <th>ARTIFACTS</th>
+        <th>NOTES</th>
+      </tr>
+    </thead>
+    <tbody id="bench-tbody"></tbody>
+  </table>
+</div>
+
+<div style="padding:0 32px 8px; font-size:0.65rem; color:#606090; letter-spacing:0.15em; text-transform:uppercase;">
+  Task breakdown by type
+</div>
+<div id="by-type"></div>
+
+<div id="footer">
+  <button class="refresh-btn" onclick="loadData()">⟳ REFRESH</button>
+  <span id="footer-ts">—</span>
+  <span>machine.machine fleet · m2o-v0.1</span>
+  <span><a href="/api/benchmarks/stats" target="_blank">export stats JSON</a></span>
+</div>
+
+<script>
+let allData = [];
+let currentFilter = "all";
+let sortCol = "started_at";
+let sortDir = -1; // -1 = desc
+
+function fmtDuration(s) {
+  s = parseInt(s||0);
+  if (!s) return "—";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.round(s/60) + "m";
+  return (s/3600).toFixed(1) + "h";
+}
+function fmtTokens(n) {
+  n = parseInt(n||0);
+  if (!n) return "—";
+  if (n >= 1000) return (n/1000).toFixed(1) + "k";
+  return n;
+}
+function fmtCost(c) {
+  c = parseFloat(c||0);
+  if (!c) return "—";
+  return "$" + c.toFixed(4);
+}
+function fmtDate(ts) {
+  if (!ts) return "—";
+  return new Date(parseInt(ts)*1000).toISOString().slice(0,16).replace("T"," ");
+}
+
+async function loadData() {
+  try {
+    const [benchRes, statsRes] = await Promise.all([
+      fetch("/api/benchmarks?limit=200"),
+      fetch("/api/benchmarks/stats"),
+    ]);
+    const benchData = await benchRes.json();
+    const stats = await statsRes.json();
+
+    allData = benchData.benchmarks || [];
+    renderStats(stats);
+    renderByType(stats);
+    renderTable();
+    document.getElementById("footer-ts").textContent = "last updated " + new Date().toISOString().slice(11,19) + " UTC";
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+function renderStats(s) {
+  document.getElementById("s-total").textContent = s.total_tasks || 0;
+  document.getElementById("s-done").textContent = s.done || 0;
+  document.getElementById("s-running").textContent = s.running || 0;
+  const tk = s.total_tokens || 0;
+  document.getElementById("s-tokens").textContent = tk >= 1000 ? (tk/1000).toFixed(0) + "k" : tk;
+  document.getElementById("s-tokens-sub").textContent = `↑${fmtTokens(s.total_tokens_in)} ↓${fmtTokens(s.total_tokens_out)}`;
+  document.getElementById("s-cost").textContent = "$" + (s.total_cost_usd||0).toFixed(4);
+  document.getElementById("s-dur").textContent = fmtDuration(s.avg_duration_s);
+}
+
+function renderByType(s) {
+  const byType = s.by_type || {};
+  const maxCount = Math.max(...Object.values(byType), 1);
+  const colors = {build:"#a080ff", research:"#44ff88", infra:"#ff4466", plan:"#ffaa00", "code-review":"#00ccff", generic:"#808080"};
+  const wrap = document.getElementById("by-type");
+  wrap.innerHTML = Object.entries(byType).map(([type, count]) => `
+    <div class="type-bar-wrap">
+      <div class="type-bar-label">${type}</div>
+      <div class="type-bar-track"><div class="type-bar-fill" style="width:${Math.round(count/maxCount*100)}%;background:${colors[type]||colors.generic}"></div></div>
+      <div class="type-bar-count" style="color:${colors[type]||colors.generic}">${count} task${count>1?"s":""}</div>
+    </div>`).join("");
+}
+
+function renderTable() {
+  const search = document.getElementById("search-box").value.toLowerCase();
+  let rows = allData.filter(b => {
+    if (currentFilter !== "all" && b.status !== currentFilter) return false;
+    if (search) {
+      const text = [b.description, b.task_type, b.agent, b.notes, b.bench_id].join(" ").toLowerCase();
+      if (!text.includes(search)) return false;
+    }
+    return true;
+  });
+
+  // Sort
+  rows.sort((a,b) => {
+    let av = a[sortCol], bv = b[sortCol];
+    if (["tokens_in","tokens_out","duration_s","cost_usd","started_at"].includes(sortCol)) {
+      av = parseFloat(av||0); bv = parseFloat(bv||0);
+    }
+    if (av < bv) return sortDir;
+    if (av > bv) return -sortDir;
+    return 0;
+  });
+
+  const tbody = document.getElementById("bench-tbody");
+  tbody.innerHTML = rows.map(b => {
+    const statusCls = `status-${b.status}`;
+    const arts = (b.artifacts||[]).map(a => {
+      const isUrl = a.startsWith("http");
+      return isUrl ? `<a href="${a}" target="_blank">${a.replace(/https?:\\/\\//,"")}</a>`
+                   : `<a href="#">${a}</a>`;
+    }).join("");
+    return `<tr>
+      <td class="td-id">${b.bench_id||b.task_id}</td>
+      <td class="td-type">${b.task_type}</td>
+      <td class="td-desc" title="${b.description}">${b.description}</td>
+      <td class="td-agent">${b.agent}</td>
+      <td class="${statusCls}">${b.status}</td>
+      <td class="td-dur">${fmtDuration(b.duration_s)}</td>
+      <td class="td-tokens">${fmtTokens(b.tokens_in)}</td>
+      <td class="td-tokens">${fmtTokens(b.tokens_out)}</td>
+      <td class="td-cost">${fmtCost(b.cost_usd)}</td>
+      <td class="td-artifacts">${arts}</td>
+      <td class="td-notes">${b.notes||""}</td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="11" style="color:#404060;text-align:center;padding:24px">No tasks found</td></tr>';
+}
+
+// Filters
+document.querySelectorAll(".filter-btn").forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll(".filter-btn").forEach(b=>b.classList.remove("active"));
+    btn.classList.add("active");
+    currentFilter = btn.dataset.filter;
+    renderTable();
+  };
+});
+document.getElementById("search-box").oninput = renderTable;
+
+// Sort headers
+document.querySelectorAll("th[data-col]").forEach(th => {
+  th.onclick = () => {
+    const col = th.dataset.col;
+    if (sortCol === col) sortDir *= -1;
+    else { sortCol = col; sortDir = -1; }
+    document.querySelectorAll("th").forEach(h=>h.classList.remove("sorted"));
+    th.classList.add("sorted");
+    th.querySelector(".sort-arrow").textContent = sortDir === -1 ? "↓" : "↑";
+    renderTable();
+  };
+});
+
+// Auto-refresh every 10s
+loadData();
+setInterval(loadData, 10000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/benchmarks", response_class=HTMLResponse)
+async def benchmarks_page():
+    return BENCH_HTML
