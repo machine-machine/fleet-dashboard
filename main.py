@@ -313,6 +313,57 @@ async def resume_task(task_id: str):
         return {"error": str(e)}
 
 
+@app.get("/api/ce/context/{task_id}")
+async def ce_context(task_id: str):
+    """Return the context bundle for a task (reads /tmp/context-{task_id}.json)."""
+    import pathlib
+    path = pathlib.Path(f"/tmp/context-{task_id}.json")
+    if not path.exists():
+        # Try to reconstruct from Redis
+        try:
+            r = get_redis()
+            data = r.hgetall(f"task:{task_id}") or {}
+            if data.get("context_summary"):
+                return {
+                    "task_id": task_id,
+                    "summary": data.get("context_summary", ""),
+                    "generation_ms": int(data.get("context_ms", 0) or 0),
+                    "memory_source": "redis-partial",
+                    "_partial": True,
+                }
+        except Exception:
+            pass
+        return {"error": "context bundle not found", "task_id": task_id}
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        return {"error": str(e), "task_id": task_id}
+
+
+@app.get("/api/ce/recent")
+async def ce_recent():
+    """Return recent CE bundles from Redis task hashes."""
+    try:
+        r = get_redis()
+        bundles = []
+        for key in r.scan_iter("task:*", count=100):
+            data = r.hgetall(key) or {}
+            if data.get("context_ms") or data.get("context_summary"):
+                bundles.append({
+                    "task_id": data.get("id", key.replace("task:", "")),
+                    "task_type": data.get("type", "?"),
+                    "state": data.get("state", "?"),
+                    "payload": data.get("payload", "")[:50],
+                    "summary": data.get("context_summary", ""),
+                    "generation_ms": int(data.get("context_ms", 0) or 0),
+                    "created_at": data.get("created_at", ""),
+                })
+        bundles.sort(key=lambda b: b.get("created_at", ""), reverse=True)
+        return {"bundles": bundles[:10], "count": len(bundles)}
+    except Exception as e:
+        return {"bundles": [], "error": str(e)}
+
+
 @app.get("/health")
 async def health():
     try:
@@ -468,6 +519,57 @@ HTML = """<!DOCTYPE html>
     border-radius:1px;
   }
 
+  /* ── CE Pipeline overlay ── */
+  #ce-pipeline {
+    position:absolute; bottom:44px; left:16px; z-index:15;
+    display:flex; align-items:center; gap:0;
+    font-size:0.55rem; letter-spacing:0.08em;
+    pointer-events:none;
+    opacity:0.85;
+  }
+  .ce-node {
+    background:#0a0a1a; border:1px solid #2a1a5a;
+    border-radius:4px; padding:4px 8px;
+    color:#8060c0; white-space:nowrap;
+    position:relative;
+    transition:border-color 0.3s, color 0.3s, box-shadow 0.3s;
+  }
+  .ce-node.active {
+    border-color:#a080ff; color:#c0a0ff;
+    box-shadow:0 0 8px #a080ff44;
+  }
+  .ce-node .ce-sub {
+    display:block; font-size:0.5rem; color:#403060; margin-top:1px;
+  }
+  .ce-arrow {
+    color:#2a1a5a; padding:0 3px; font-size:0.7rem; line-height:1;
+  }
+  .ce-arrow.active { color:#6040a0; }
+
+  /* ── CE Bundle modal ── */
+  #ce-modal {
+    display:none; position:fixed; top:0; left:0; right:0; bottom:0;
+    background:#00000099; z-index:1000;
+    align-items:center; justify-content:center;
+  }
+  #ce-modal.open { display:flex; }
+  #ce-modal-inner {
+    background:#0a0a18; border:1px solid #2a2a5a;
+    border-radius:6px; padding:24px; max-width:580px; width:90%;
+    max-height:80vh; overflow-y:auto;
+    font-size:0.72rem; line-height:1.6;
+  }
+  #ce-modal-inner h2 { color:#a080ff; font-size:0.8rem; letter-spacing:0.2em; margin-bottom:12px; }
+  .ce-section-label { color:#6060a0; font-size:0.6rem; letter-spacing:0.15em;
+    text-transform:uppercase; margin:10px 0 4px; }
+  .ce-summary { color:#c0c0e0; }
+  .ce-item { color:#909090; padding:2px 0 2px 10px; border-left:2px solid #2a2a5a; margin:3px 0; }
+  .ce-warn  { color:#ffaa44; padding:2px 0 2px 10px; border-left:2px solid #554422; margin:3px 0; }
+  .ce-fact  { color:#60c0ff; }
+  .ce-meta  { color:#404060; font-size:0.6rem; margin-top:12px; }
+  #ce-modal-close { float:right; background:none; border:1px solid #2a2a5a;
+    color:#606090; cursor:pointer; padding:2px 8px; border-radius:3px; font-family:inherit; }
+
   /* ── Maximize toggle ── */
   #maximize-btn {
     position:absolute; top:12px; right:12px; z-index:20;
@@ -618,6 +720,30 @@ HTML = """<!DOCTYPE html>
     <svg id="graph-svg"></svg>
     <canvas id="canvas-overlay"></canvas>
     <div id="fleet-status">connecting...</div>
+
+    <!-- CE Pipeline -->
+    <div id="ce-pipeline">
+      <div class="ce-node" id="cep-memory">
+        m2-memory
+        <span class="ce-sub">12k vectors</span>
+      </div>
+      <div class="ce-arrow" id="cea-1">→</div>
+      <div class="ce-node" id="cep-embed">
+        BGE-M3
+        <span class="ce-sub">embed + search</span>
+      </div>
+      <div class="ce-arrow" id="cea-2">→</div>
+      <div class="ce-node" id="cep-gemini">
+        Gemini Flash
+        <span class="ce-sub">distill</span>
+      </div>
+      <div class="ce-arrow" id="cea-3">→</div>
+      <div class="ce-node" id="cep-bundle">
+        context bundle
+        <span class="ce-sub" id="cep-stats">idle</span>
+      </div>
+    </div>
+
     <div id="legend">
       <div class="leg-row"><div class="leg-dot" style="background:#00ff88"></div> alive</div>
       <div class="leg-row"><div class="leg-dot" style="background:#ffaa00"></div> degraded</div>
@@ -648,6 +774,14 @@ HTML = """<!DOCTYPE html>
     <div class="panel-section" style="max-height:200px">
       <h3>⬡ Active Tasks</h3>
       <div id="tasks-list"><div style="color:#404060;font-size:0.65rem;">no active tasks</div></div>
+    </div>
+
+    <!-- CE Inspector Panel -->
+    <div class="panel-section" id="ce-inspector-section" style="max-height:180px;overflow:hidden;">
+      <h3>⚡ Context Engineer</h3>
+      <div id="ce-inspector-content" style="color:#404060;font-size:0.62rem;">
+        no bundles yet
+      </div>
     </div>
 
     <h3 style="padding:10px 14px 4px;font-size:0.65rem;letter-spacing:0.2em;color:#6060a0;text-transform:uppercase;">◈ Event Stream</h3>
@@ -1128,6 +1262,7 @@ function updateFleetData(data) {
   updateEventsPanel(data.events || []);
   updateTasksPanel(data.tasks || []);
   updateFleetStatus(data);
+  checkForCETrigger(data.events || []);
 
   // Reinit graph if agent set changed
   const newAgentIds = new Set((data.agents||[]).map(a=>a.id));
@@ -1313,7 +1448,174 @@ setInterval(() => {
   spawnParticles(from, to, color, 2, 2);
 }, 4000);
 
+// ── Context Engineer Visualization ───────────────────────────────────────────
+
+let _ceActive = false;
+let _ceLastBundle = null;
+
+const _ceNodes  = ["cep-memory","cep-embed","cep-gemini","cep-bundle"];
+const _ceArrows = ["cea-1","cea-2","cea-3"];
+
+function cePipelineIdle() {
+  _ceNodes.forEach(id => document.getElementById(id)?.classList.remove("active"));
+  _ceArrows.forEach(id => document.getElementById(id)?.classList.remove("active"));
+  const stats = document.getElementById("cep-stats");
+  if (stats && _ceLastBundle) {
+    stats.textContent = `${_ceLastBundle.memories_searched}mem · ${_ceLastBundle.generation_ms}ms`;
+  } else if (stats) {
+    stats.textContent = "idle";
+  }
+}
+
+async function cePipelineAnimate(taskId) {
+  if (_ceActive) return;
+  _ceActive = true;
+
+  // Step through pipeline nodes with delays
+  const steps = [
+    {node: "cep-memory",  arrow: null,    delay: 0},
+    {node: "cep-embed",   arrow: "cea-1", delay: 350},
+    {node: "cep-gemini",  arrow: "cea-2", delay: 700},
+    {node: "cep-bundle",  arrow: "cea-3", delay: 1050},
+  ];
+
+  for (const step of steps) {
+    await new Promise(r => setTimeout(r, step.delay));
+    document.getElementById(step.node)?.classList.add("active");
+    if (step.arrow) document.getElementById(step.arrow)?.classList.add("active");
+  }
+
+  // Fetch bundle and update inspector
+  if (taskId) {
+    try {
+      const data = await fetch(`/api/ce/context/${taskId}`).then(r => r.json());
+      if (!data.error) {
+        _ceLastBundle = data;
+        updateCEInspector(data);
+      }
+    } catch(e) {}
+  }
+
+  await new Promise(r => setTimeout(r, 1200));
+  _ceActive = false;
+  cePipelineIdle();
+}
+
+function updateCEInspector(bundle) {
+  const el = document.getElementById("ce-inspector-content");
+  if (!el || !bundle) return;
+  const src = bundle.memory_source === "m2-memory"
+    ? '<span style="color:#a080ff">m2-memory</span>'
+    : '<span style="color:#604080">qdrant-direct</span>';
+  const model = bundle._model
+    ? `<span style="color:#404060">${bundle._model}</span>`
+    : '<span style="color:#333">no distillation</span>';
+  el.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:6px;align-items:center;">
+      <span style="color:#00ff88">${bundle.memories_searched || 0} memories</span>
+      <span style="color:#404060">·</span>
+      <span style="color:#a080ff">${bundle.generation_ms || 0}ms</span>
+      <span style="color:#404060">·</span>${src}
+    </div>
+    <div style="color:#8080a0;margin-bottom:4px;font-style:italic;">${(bundle.summary||'').slice(0,100)}...</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px;">
+      ${(bundle.warnings||[]).slice(0,2).map(w=>`<span style="color:#ffaa44;font-size:0.58rem">⚠ ${w.slice(0,40)}</span>`).join('')}
+      ${(bundle.prior_decisions||[]).slice(0,2).map(d=>`<span style="color:#505080;font-size:0.58rem">• ${d.slice(0,40)}</span>`).join('')}
+    </div>
+    <div style="margin-top:6px;">
+      <button onclick="openCEModal()" style="background:none;border:1px solid #2a2a5a;color:#6060a0;
+        font-family:inherit;font-size:0.58rem;cursor:pointer;padding:2px 6px;border-radius:2px;">
+        inspect bundle →
+      </button>
+    </div>
+  `;
+}
+
+// Fetch recent CE bundles on load
+async function loadCERecent() {
+  try {
+    const data = await fetch("/api/ce/recent").then(r => r.json());
+    if (data.bundles && data.bundles.length > 0) {
+      const latest = data.bundles[0];
+      _ceLastBundle = latest;
+      updateCEInspector(latest);
+      const stats = document.getElementById("cep-stats");
+      if (stats) stats.textContent = `${latest.memories_searched||0}mem · ${latest.generation_ms||0}ms`;
+    }
+  } catch(e) {}
+}
+loadCERecent();
+
+// Trigger CE animation when a task goes from pending → claimed in the event stream
+const _seenCEAnimations = new Set();
+function checkForCETrigger(events) {
+  for (const ev of (events || [])) {
+    if (ev.type === "task_claimed" && !_seenCEAnimations.has(ev.task_id)) {
+      _seenCEAnimations.add(ev.task_id);
+      cePipelineAnimate(ev.task_id);
+      break;
+    }
+  }
+}
+
+// CE Modal
+function openCEModal() {
+  const bundle = _ceLastBundle;
+  if (!bundle) return;
+  const modal = document.getElementById("ce-modal");
+  const inner = document.getElementById("ce-modal-body");
+  if (!inner || !modal) return;
+
+  const facts = Object.entries(bundle.key_facts || {}).slice(0,6);
+
+  inner.innerHTML = `
+    <div class="ce-section-label">Summary</div>
+    <div class="ce-summary">${bundle.summary || '—'}</div>
+
+    ${(bundle.prior_decisions||[]).length ? `
+      <div class="ce-section-label">Prior Decisions (${bundle.prior_decisions.length})</div>
+      ${bundle.prior_decisions.map(d => `<div class="ce-item">${d}</div>`).join('')}
+    ` : ''}
+
+    ${(bundle.warnings||[]).length ? `
+      <div class="ce-section-label">Warnings</div>
+      ${bundle.warnings.map(w => `<div class="ce-warn">⚠ ${w}</div>`).join('')}
+    ` : ''}
+
+    ${facts.length ? `
+      <div class="ce-section-label">Key Facts</div>
+      ${facts.map(([k,v]) => `<div class="ce-fact">${k}: <span style="color:#c0c0e0">${JSON.stringify(v).slice(0,60)}</span></div>`).join('')}
+    ` : ''}
+
+    ${(bundle.relevant_files||[]).length ? `
+      <div class="ce-section-label">Relevant Files</div>
+      ${bundle.relevant_files.map(f => `<div class="ce-item">${f}</div>`).join('')}
+    ` : ''}
+
+    <div class="ce-meta">
+      task: ${bundle.task_id} · type: ${bundle.task_type}
+      · memories: ${bundle.memories_searched} (${bundle.memory_source})
+      · model: ${bundle._model || 'none'}
+      · ${bundle.generation_ms}ms
+      · distilled: ${bundle._distilled ? '✓' : '✗'}
+    </div>
+  `;
+  modal.classList.add("open");
+}
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") document.getElementById("ce-modal")?.classList.remove("open");
+});
 </script>
+
+<!-- CE Modal -->
+<div id="ce-modal">
+  <div id="ce-modal-inner">
+    <button id="ce-modal-close" onclick="document.getElementById('ce-modal').classList.remove('open')">✕ close</button>
+    <h2>⚡ Context Bundle Inspector</h2>
+    <div id="ce-modal-body"></div>
+  </div>
+</div>
 </body>
 </html>"""
 
