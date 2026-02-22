@@ -27,16 +27,19 @@ try:
 except ImportError:
     BENCH_ENABLED = False
 
-# Context Engineer
-FLEET_BUS_DIR = os.path.join(os.path.dirname(__file__), "..", "fleet-bus")
-sys.path.insert(0, os.path.abspath(FLEET_BUS_DIR))
+# Context Engineer — search in /app (container), then ../fleet-bus (local dev)
+for _ce_dir in [
+    os.path.dirname(__file__),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "fleet-bus")),
+]:
+    if _ce_dir not in sys.path:
+        sys.path.insert(0, _ce_dir)
+
 try:
     import context_engineer as CE
     CE_ENABLED = True
 except ImportError:
     CE_ENABLED = False
-    log_placeholder = logging.getLogger("executor")
-    log_placeholder.warning("context_engineer not found — CE disabled")
 
 logging.basicConfig(
     level=logging.INFO,
