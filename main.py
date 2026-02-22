@@ -161,16 +161,23 @@ async def fleet_api():
 
 @app.get("/api/tasks")
 async def list_tasks():
-    r = get_redis()
-    task_types = ["research", "build", "plan", "code-review", "generic"]
-    tasks = []
-    for tt in task_types:
-        task_ids = r.lrange(f"tasks:{tt}", 0, 10)
-        for tid in task_ids:
-            data = r.hgetall(f"task:{tid}") or {}
-            if data:
-                tasks.append(data)
-    return {"tasks": tasks}
+    try:
+        r = get_redis()
+        tasks = []
+        # Scan all task:* keys directly (catches queued + claimed + running)
+        for key in r.scan_iter("task:*", count=50):
+            data = r.hgetall(key) or {}
+            if data and data.get("state") in ("pending", "claimed", "running"):
+                tasks.append({
+                    "id": data.get("id", key.replace("task:", "")),
+                    "type": data.get("type", "generic"),
+                    "state": data.get("state", "?"),
+                    "payload": data.get("payload", "")[:60],
+                    "assigned_to": data.get("assigned_to", ""),
+                })
+        return {"tasks": tasks}
+    except Exception as e:
+        return {"tasks": [], "error": str(e)}
 
 
 @app.get("/health")
