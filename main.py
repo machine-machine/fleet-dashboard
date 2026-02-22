@@ -81,22 +81,20 @@ def get_fleet_data():
                 "task_id": data.get("task_id", ""),
             })
 
-        # Tasks
-        task_types = ["research", "build", "plan", "code-review", "generic"]
+        # Tasks — scan all task:* keys directly to catch queued + claimed + running
         tasks = []
-        for tt in task_types:
-            task_ids = r.lrange(f"tasks:{tt}", 0, 5)
-            for tid in task_ids:
-                tdata = r.hgetall(f"task:{tid}") or {}
-                if tdata:
-                    tasks.append({
-                        "id": tid,
-                        "type": tdata.get("type", tt),
-                        "state": tdata.get("state", "pending"),
-                        "payload": tdata.get("payload", "")[:60],
-                        "assigned_to": tdata.get("assigned_to", ""),
-                        "created_at": tdata.get("created_at", ""),
-                    })
+        for key in r.scan_iter("task:*", count=50):
+            tdata = r.hgetall(key) or {}
+            if tdata and tdata.get("state") in ("pending", "claimed", "running"):
+                tid = tdata.get("id", key.replace("task:", ""))
+                tasks.append({
+                    "id": tid,
+                    "type": tdata.get("type", "generic"),
+                    "state": tdata.get("state", "pending"),
+                    "payload": tdata.get("payload", "")[:60],
+                    "assigned_to": tdata.get("assigned_to", ""),
+                    "created_at": tdata.get("created_at", ""),
+                })
 
         return {
             "agents": agents,
