@@ -103,6 +103,8 @@ def get_fleet_data():
                     "payload": tdata.get("payload", "")[:60],
                     "assigned_to": tdata.get("assigned_to", ""),
                     "created_at": tdata.get("created_at", ""),
+                    "context_summary": tdata.get("context_summary", ""),
+                    "context_ms": int(tdata.get("context_ms", 0) or 0),
                 })
 
         return {
@@ -443,7 +445,7 @@ HTML = """<!DOCTYPE html>
   <div id="graph-area">
     <div id="header">
       <h1>⚡ M2O Fleet Command</h1>
-      <div class="sub">machine.machine · autonomous agent fleet · <a href="/benchmarks" style="color:#6060a0;text-decoration:none;font-size:0.6rem;letter-spacing:0.1em;" target="_blank">benchmarks →</a></div>
+      <div class="sub">machine.machine · autonomous agent fleet · <a href="/benchmarks" style="color:#6060a0;text-decoration:none;font-size:0.6rem;letter-spacing:0.1em;" target="_blank">benchmarks →</a> · <span id="ce-status" style="color:#604080;font-size:0.6rem;letter-spacing:0.08em;" title="Context Engineer: pre-loads semantic memory before each agent spawn">⚡ CE active</span></div>
     </div>
     <svg id="graph-svg"></svg>
     <canvas id="canvas-overlay"></canvas>
@@ -915,16 +917,25 @@ function updateTasksPanel(tasks) {
     el.innerHTML = '<div style="color:#404060;font-size:0.65rem;">no active tasks</div>';
     return;
   }
-  el.innerHTML = tasks.map(t => `
-    <div class="task-card">
+  el.innerHTML = tasks.map(t => {
+    const ceBadge = t.context_ms > 0
+      ? `<span title="${t.context_summary}" style="color:#a080ff;font-size:0.55rem;cursor:help">⚡CE ${t.context_ms}ms</span>`
+      : '';
+    const ctxLine = t.context_summary
+      ? `<div style="color:#604080;font-size:0.6rem;margin-top:2px;font-style:italic">${t.context_summary.slice(0,80)}</div>`
+      : '';
+    return `<div class="task-card">
       <div class="task-header">
         <span class="task-id">#${t.id}</span>
         <span class="task-type">${t.type}</span>
+        ${ceBadge}
       </div>
       <div class="task-payload">${t.payload}</div>
+      ${ctxLine}
       ${t.assigned_to ? `<div class="task-agent">→ ${t.assigned_to}</div>` : ''}
       <div class="state-${t.state}">${t.state}</div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 }
 
 function updateFleetStatus(data) {
