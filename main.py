@@ -447,13 +447,49 @@ HTML = """<!DOCTYPE html>
     font-size:0.65rem; color:#404060;
   }
 
+  /* ── Resize handle ── */
+  #resize-handle {
+    width:5px; flex-shrink:0;
+    background:transparent;
+    cursor:col-resize;
+    position:relative;
+    z-index:20;
+    transition:background 0.15s;
+  }
+  #resize-handle:hover, #resize-handle.dragging {
+    background:#a080ff44;
+  }
+  #resize-handle::after {
+    content:'';
+    position:absolute; top:50%; left:50%;
+    transform:translate(-50%,-50%);
+    width:1px; height:40px;
+    background:#2a2a5a;
+    border-radius:1px;
+  }
+
+  /* ── Maximize toggle ── */
+  #maximize-btn {
+    position:absolute; top:12px; right:12px; z-index:20;
+    background:#0d0d1a; border:1px solid #2a2a5a;
+    color:#6060a0; font-family:inherit; font-size:0.65rem;
+    padding:3px 8px; border-radius:3px; cursor:pointer;
+    letter-spacing:0.1em; transition:all 0.15s;
+  }
+  #maximize-btn:hover { border-color:#a080ff; color:#a080ff; }
+
   /* ── Side panel ── */
   #panel {
-    width:340px; min-width:280px;
+    width:340px; min-width:0;
     background:#080810;
     border-left:1px solid #1a1a3a;
     display:flex; flex-direction:column;
     overflow:hidden;
+    transition:width 0.25s ease;
+  }
+  #panel.collapsed {
+    width:0 !important;
+    border-left:none;
   }
   .panel-section {
     border-bottom:1px solid #1a1a3a;
@@ -578,6 +614,7 @@ HTML = """<!DOCTYPE html>
       <h1>⚡ M2O Fleet Command</h1>
       <div class="sub">machine.machine · autonomous agent fleet · <a href="/benchmarks" style="color:#6060a0;text-decoration:none;font-size:0.6rem;letter-spacing:0.1em;" target="_blank">benchmarks →</a> · <span id="ce-status" style="color:#604080;font-size:0.6rem;letter-spacing:0.08em;" title="Context Engineer: pre-loads semantic memory before each agent spawn">⚡ CE active</span></div>
     </div>
+    <button id="maximize-btn" onclick="togglePanel()" title="Maximize / restore panel">⟷</button>
     <svg id="graph-svg"></svg>
     <canvas id="canvas-overlay"></canvas>
     <div id="fleet-status">connecting...</div>
@@ -588,6 +625,9 @@ HTML = """<!DOCTYPE html>
       <div class="leg-row"><div class="leg-dot" style="background:#a080ff"></div> orchestrator</div>
     </div>
   </div>
+
+  <!-- Resize handle -->
+  <div id="resize-handle"></div>
 
   <!-- Panel -->
   <div id="panel">
@@ -683,6 +723,85 @@ function resizeCanvas() {
 }
 resizeCanvas();
 window.addEventListener("resize", () => { resizeCanvas(); initGraph(); });
+
+// ── Panel resize drag ─────────────────────────────────────────────────────────
+const panel       = document.getElementById("panel");
+const resizeHandle= document.getElementById("resize-handle");
+const maximizeBtn = document.getElementById("maximize-btn");
+const MIN_PANEL   = 240;   // px
+const MAX_PANEL   = 560;   // px
+const SNAP_CLOSED = 80;    // px — collapse if dragged below this
+
+let _panelWidthBeforeCollapse = 340;
+
+function applyPanelWidth(w, animate) {
+  if (animate) panel.style.transition = "width 0.25s ease";
+  else         panel.style.transition = "none";
+  panel.style.width = w + "px";
+  panel.classList.remove("collapsed");
+  setTimeout(() => { resizeCanvas(); initGraph(); }, animate ? 260 : 0);
+}
+
+function togglePanel() {
+  if (panel.classList.contains("collapsed") || parseInt(panel.style.width||340) < 30) {
+    // Restore
+    panel.classList.remove("collapsed");
+    applyPanelWidth(_panelWidthBeforeCollapse, true);
+    resizeHandle.style.display = "";
+    maximizeBtn.textContent = "⟷";
+    maximizeBtn.title = "Collapse panel";
+  } else {
+    // Collapse
+    _panelWidthBeforeCollapse = parseInt(panel.style.width || 340);
+    panel.style.transition = "width 0.25s ease";
+    panel.style.width = "0px";
+    panel.classList.add("collapsed");
+    resizeHandle.style.display = "none";
+    maximizeBtn.textContent = "◨";
+    maximizeBtn.title = "Restore panel";
+    setTimeout(() => { resizeCanvas(); initGraph(); }, 260);
+  }
+}
+
+resizeHandle.addEventListener("mousedown", e => {
+  e.preventDefault();
+  resizeHandle.classList.add("dragging");
+
+  const startX     = e.clientX;
+  const startWidth = parseInt(panel.style.width || 340);
+
+  function onMove(ev) {
+    const delta = startX - ev.clientX;  // dragging left = wider panel
+    const newW  = Math.max(0, Math.min(MAX_PANEL, startWidth + delta));
+
+    if (newW < SNAP_CLOSED) {
+      // Snap closed
+      panel.style.transition = "none";
+      panel.style.width = "0px";
+      panel.classList.add("collapsed");
+      resizeHandle.style.display = "none";
+      maximizeBtn.textContent = "◨";
+    } else {
+      panel.classList.remove("collapsed");
+      panel.style.transition = "none";
+      panel.style.width = newW + "px";
+      maximizeBtn.textContent = "⟷";
+    }
+    resizeCanvas();
+  }
+
+  function onUp() {
+    resizeHandle.classList.remove("dragging");
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    const finalW = parseInt(panel.style.width || 0);
+    if (finalW >= SNAP_CLOSED) _panelWidthBeforeCollapse = finalW;
+    initGraph();
+  }
+
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup",   onUp);
+});
 
 // ── Force simulation ───────────────────────────────────────────────────────────
 let simulation, linkSel, nodeSel, allNodes, allLinks;
