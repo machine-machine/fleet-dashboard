@@ -82,16 +82,42 @@ def emit_event(r, agent, event_type, **kwargs):
 
 
 def claim_task(r, task_type: str):
-    """Pop a task_id from the queue and claim it."""
-    task_id = r.rpop(f"tasks:{task_type}")
-    if not task_id:
+    """Pop a task from the queue and claim it.
+    Handles two queue formats:
+      - fleet-bus.sh format: full JSON task object in the queue value
+      - legacy format: task_id string in queue, task details in hash task:{task_id}
+    """
+    raw = r.rpop(f"tasks:{task_type}")
+    if not raw:
         return None
-    task = r.hgetall(f"task:{task_id}")
+
+    # Detect format — fleet-bus.sh pushes full JSON
+    task = None
+    task_id = None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and "id" in parsed:
+            # Full JSON format from fleet-bus.sh
+            task_id = parsed["id"]
+            task = parsed
+            # Store in hash for consistency
+            r.hset(f"task:{task_id}", mapping={
+                k: str(v) for k, v in task.items()
+            })
+        else:
+            task_id = raw  # fallback: treat as task_id string
+    except (json.JSONDecodeError, TypeError):
+        task_id = raw  # legacy: plain task_id string
+
+    if task is None:
+        task = r.hgetall(f"task:{task_id}")
     if not task:
+        log.warning(f"Task {task_id} not found in hash — skipping")
         return None
     if task.get("state") not in ("pending", None, ""):
         log.info(f"Skipping task {task_id} — state={task.get('state')}")
         return None
+
     # Mark claimed
     r.hset(f"task:{task_id}", mapping={
         "state": "claimed",
