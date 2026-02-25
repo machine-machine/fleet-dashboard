@@ -302,6 +302,49 @@ def complete_task(r, task_id: str, success: bool, result: str = ""):
     log.info(f"Task {task_id} {'done' if success else 'failed'}")
 
 
+def dark_factory_trigger(r, task_type: str):
+    """
+    Dark Factory auto-compile trigger.
+    Counts successful completions per task type. When count hits a power-of-3
+    threshold (3, 9, 27...), compile the matching workflow template into a skill.
+    This converts repeated manual patterns into free, deterministic skills.
+    """
+    THRESHOLDS = {3, 9, 27, 81, 243}
+    DARK_FACTORY_DIR = os.path.expanduser(
+        "~/.openclaw/workspace/projects/dark-factory-engine"
+    )
+    compile_bin  = os.path.join(DARK_FACTORY_DIR, "bin", "compile")
+    templates_dir = os.path.join(DARK_FACTORY_DIR, "workflow-templates")
+    template_path = os.path.join(templates_dir, f"{task_type}.md")
+
+    # Increment counter
+    count = r.incr(f"task_type_count:{task_type}")
+    log.info(f"Dark Factory counter: {task_type}={count}")
+
+    if int(count) not in THRESHOLDS:
+        return
+
+    # Threshold hit — check template exists
+    if not os.path.exists(template_path):
+        log.info(f"Dark Factory: no template for {task_type}, skipping compile")
+        emit_event(r, AGENT_ID, "dark_factory_no_template",
+                   task_type=task_type, count=str(count))
+        return
+
+    # Compile in background (non-blocking)
+    if os.path.exists(compile_bin):
+        log.info(f"Dark Factory: compiling {task_type} at count={count}")
+        subprocess.Popen(
+            [compile_bin, template_path],
+            stdout=open(f"/tmp/dark-factory-{task_type}.log", "w"),
+            stderr=subprocess.STDOUT,
+        )
+        emit_event(r, AGENT_ID, "dark_factory_compile_triggered",
+                   task_type=task_type, count=str(count), template=template_path)
+    else:
+        log.warning(f"Dark Factory: compile bin not found at {compile_bin}")
+
+
 def check_active_tasks(r) -> int:
     """
     Count tasks currently assigned to this agent.
@@ -418,6 +461,7 @@ def executor_loop(dry_run: bool = False, once: bool = False):
                     if spawn_result.get("inline"):
                         complete_task(r, claimed["id"], True,
                                       f"processed inline by {AGENT_ID}")
+                        dark_factory_trigger(r, claimed.get("type", "generic"))
                         # Try to get real tokens from session if available
                         real_tokens = {"tokens_in": 0, "tokens_out": 0}
                         if session_key:
