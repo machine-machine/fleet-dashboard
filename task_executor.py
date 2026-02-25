@@ -56,6 +56,16 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
 TASK_TIMEOUT   = int(os.getenv("TASK_TIMEOUT_SECS", "600"))  # 10 min
 COST_CAP_USD   = float(os.getenv("TASK_COST_CAP_USD", "0.50"))
 
+# Model routing — orchestrator (opus) delegates execution to cheaper models
+# Override per task type via env: EXECUTOR_MODEL_RESEARCH, EXECUTOR_MODEL_BUILD, etc.
+MODEL_BY_TASK = {
+    "research":    os.getenv("EXECUTOR_MODEL_RESEARCH",    "openrouter/thudm/glm-z1-32b:free"),
+    "build":       os.getenv("EXECUTOR_MODEL_BUILD",       "anthropic/claude-sonnet-4-6"),
+    "code-review": os.getenv("EXECUTOR_MODEL_CODE_REVIEW", "anthropic/claude-sonnet-4-6"),
+    "plan":        os.getenv("EXECUTOR_MODEL_PLAN",        "anthropic/claude-sonnet-4-6"),
+    "generic":     os.getenv("EXECUTOR_MODEL_GENERIC",     "openrouter/thudm/glm-z1-32b:free"),
+}
+
 # OpenClaw gateway for sessions_spawn
 OPENCLAW_GATEWAY = os.getenv("OPENCLAW_GATEWAY", "http://localhost:18789")
 
@@ -206,10 +216,15 @@ def spawn_sub_agent(task: dict, dry_run: bool = False) -> dict:
         log.info(f"Prompt preview: {prompt[:200]}...")
         return {"dry_run": True, "task_id": task_id}
 
+    # Select execution model based on task type (orchestrator delegates to cheaper model)
+    exec_model = MODEL_BY_TASK.get(task_type, MODEL_BY_TASK["generic"])
+    log.info(f"Model routing: task_type={task_type} → model={exec_model}")
+
     # Use openclaw CLI to spawn
     cmd = [
         "openclaw", "sessions", "spawn",
         "--label", f"task-{task_id}",
+        "--model", exec_model,
         "--timeout", str(TASK_TIMEOUT),
         "--message", prompt,
     ]
