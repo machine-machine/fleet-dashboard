@@ -1962,3 +1962,16 @@ setInterval(loadData, 10000);
 @app.get("/benchmarks", response_class=HTMLResponse)
 async def benchmarks_page():
     return BENCH_HTML
+
+
+@app.get("/api/load")
+async def load_stats():
+    """Return fleet container CPU/RAM stats from Redis"""
+    try:
+        r = get_redis()
+        raw = r.get("fleet:load_stats")
+        if raw:
+            return JSONResponse(json.loads(raw))
+        return JSONResponse({"error": "no data yet", "containers": []})
+    except Exception as e:
+        return JSONResponse({"error": str(e), "containers": []})
